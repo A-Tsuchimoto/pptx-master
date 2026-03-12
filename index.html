@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PPTX テンプレート解析・生成アプリ</title>
+    <style>
+      :root { font-family: Inter, system-ui, sans-serif; color: #1f2937; background: #f8fafc; }
+      * { box-sizing: border-box; }
+      body { margin: 0; }
+      .container { max-width: 980px; margin: 0 auto; padding: 24px; }
+      h1 { margin-top: 0; font-size: 1.6rem; }
+      .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+      label { font-size: 0.9rem; font-weight: 600; display: block; margin-bottom: 6px; }
+      input, textarea, button { font: inherit; }
+      input[type="file"], input[type="number"], textarea { width: 100%; padding: 8px; border: 1px solid #cbd5e1; border-radius: 8px; }
+      button { border: 0; border-radius: 8px; background: #2563eb; color: #fff; padding: 10px 14px; cursor: pointer; }
+      button:disabled { background: #94a3b8; cursor: not-allowed; }
+      .tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+      .tab { background: #e2e8f0; color: #0f172a; }
+      .tab.active { background: #0f172a; color: #fff; }
+      .notice { padding: 10px; border-radius: 8px; margin-top: 10px; }
+      .notice.error { background: #fee2e2; color: #991b1b; }
+      .notice.warn { background: #ffedd5; color: #9a3412; }
+      .notice.ok { background: #dcfce7; color: #166534; }
+      .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      @media (max-width: 860px) { .grid2 { grid-template-columns: 1fr; } }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/fast-xml-parser@4.5.0/src/fxp.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/dist/pptxgen.bundle.js"></script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      const app = document.getElementById('app');
+      const q = (sel) => document.querySelector(sel);
+      const EMU_PER_INCH = 914400;
+      const PT_PER_HALF = 2;
+
+      const state = { tab: 'analyze', analysis: null, masterJsonText: '', analyzeStatus: null, generateStatus: null, csvHeaders: [] };
+      const parser = new FXP.XMLParser({ ignoreAttributes: false, attributeNamePrefix: '', parseTagValue: false, trimValues: true });
+
+      const asArray = (v) => (!v ? [] : Array.isArray(v) ? v : [v]);
+      const toInch = (emu) => Number(((Number(emu) || 0) / EMU_PER_INCH).toFixed(3));
+      const safe = (v, fallback = '') => (v ?? fallback);
+
+      function parseShapeStyle(spPr, txBody, styleNode) {
+        const fill = spPr?.['a:solidFill'];
+        const ln = spPr?.['a:ln'];
+        const defRPr = txBody?.['a:lstStyle']?.['a:defPPr']?.['a:defRPr'] || txBody?.['a:p']?.['a:pPr']?.['a:defRPr'];
+        const rPr = txBody?.['a:p']?.['a:r']?.['a:rPr'] || defRPr || styleNode;
+        return {
+          color: safe(rPr?.['a:solidFill']?.['a:srgbClr']?.val || fill?.['a:srgbClr']?.val, '000000'),
+          fontFace: safe(rPr?.latin?.typeface || rPr?.['a:latin']?.typeface, 'Arial'),
+          fontSize: rPr?.sz ? Number(rPr.sz) / PT_PER_HALF : 18,
+          bold: rPr?.b === '1' || rPr?.b === 1,
+          align: safe(txBody?.['a:p']?.['a:pPr']?.algn, 'left'),
+          lineColor: safe(ln?.['a:solidFill']?.['a:srgbClr']?.val)
+        };
+      }
+
+      function parseText(sp) {
+        return asArray(sp['p:txBody']?.['a:p']).map((p) => {
+          const runs = asArray(p['a:r']);
+          if (!runs.length && p['a:fld']) return asArray(p['a:fld']).map((f) => f['a:t']).join('');
+          return runs.map((r) => r['a:t']).join('');
+        }).join('\n').trim();
+      }
+
+      async function analyzePptx(file, pageNum) {
+        const zip = await JSZip.loadAsync(file);
+        const slidePath = `ppt/slides/slide${pageNum}.xml`;
+        const slideEntry = zip.file(slidePath);
+        if (!slideEntry) throw new Error(`指定ページが存在しません: ${pageNum}`);
+
+        const presentationXml = await zip.file('ppt/presentation.xml')?.async('string');
+        const presentation = presentationXml ? parser.parse(presentationXml) : null;
+        const slideSize = presentation?.['p:presentation']?.['p:sldSz'] || {};
+        const xml = await slideEntry.async('string');
+        const doc = parser.parse(xml);
+        const spTree = doc?.['p:sld']?.['p:cSld']?.['p:spTree'];
+
+        const elements = [];
+        asArray(spTree?.['p:sp']).forEach((sp, idx) => {
+          const name = safe(sp?.['p:nvSpPr']?.['p:cNvPr']?.name, `shape_${idx + 1}`);
+          const id = safe(sp?.['p:nvSpPr']?.['p:cNvPr']?.id, `shape_${idx + 1}`);
+          const xfrm = sp?.['p:spPr']?.['a:xfrm'];
+          const off = xfrm?.['a:off'] || {};
+          const ext = xfrm?.['a:ext'] || {};
+          const text = parseText(sp);
+          elements.push({
+            id: String(id), type: text ? 'text' : 'rectangle', name,
+            x: toInch(off.x), y: toInch(off.y), w: toInch(ext.cx), h: toInch(ext.cy),
+            style: parseShapeStyle(sp?.['p:spPr'], sp?.['p:txBody'], sp?.['p:style']),
+            defaultText: text || undefined,
+            binding: { mode: text ? 'field' : 'ignore', key: text ? name : '' }
+          });
+        });
+
+        asArray(spTree?.['p:pic']).forEach((pic, idx) => {
+          const name = safe(pic?.['p:nvPicPr']?.['p:cNvPr']?.name, `image_${idx + 1}`);
+          const id = safe(pic?.['p:nvPicPr']?.['p:cNvPr']?.id, `image_${idx + 1}`);
+          const xfrm = pic?.['p:spPr']?.['a:xfrm'];
+          const off = xfrm?.['a:off'] || {};
+          const ext = xfrm?.['a:ext'] || {};
+          elements.push({
+            id: String(id), type: 'image', name,
+            x: toInch(off.x), y: toInch(off.y), w: toInch(ext.cx), h: toInch(ext.cy),
+            style: {}, binding: { mode: 'field', key: name }
+          });
+        });
+
+        return {
+          templateName: file.name.replace(/\.pptx$/i, ''),
+          slideSize: { width: toInch(slideSize.cx || 12192000), height: toInch(slideSize.cy || 6858000) },
+          pages: [{ sourcePage: pageNum, elements }]
+        };
+      }
+
+      function escapeHTML(s) { return String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;'); }
+      function renderNotice(n) { return !n ? '' : `<div class="notice ${n.kind}">${escapeHTML(n.message)}</div>`; }
+      function downloadJson(filename, obj) {
+        const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click(); URL.revokeObjectURL(a.href);
+      }
+
+      function render() {
+        app.innerHTML = `<div class="container">
+            <h1>PPTXテンプレート解析・スライド生成</h1>
+            <div class="tabs">
+              <button class="tab ${state.tab === 'analyze' ? 'active' : ''}" id="tab-analyze">テンプレート解析</button>
+              <button class="tab ${state.tab === 'generate' ? 'active' : ''}" id="tab-generate">スライド生成</button>
+            </div>
+            ${state.tab === 'analyze' ? `
+              <div class="card">
+                <div class="grid2">
+                  <div><label>PPTXファイル</label><input id="analyze-file" type="file" accept=".pptx" /></div>
+                  <div><label>対象ページ番号 (1始まり)</label><input id="analyze-page" type="number" min="1" value="1" /></div>
+                </div>
+                <div style="margin-top:12px;display:flex;gap:8px;"><button id="run-analyze">解析する</button><button id="download-master" ${state.analysis ? '' : 'disabled'}>master.json ダウンロード</button></div>
+                ${renderNotice(state.analyzeStatus)}
+              </div>
+              <div class="card"><label>抽出結果 (編集可能)</label><textarea id="master-json" rows="20">${escapeHTML(state.masterJsonText || '')}</textarea></div>
+            ` : `
+              <div class="card">
+                <div class="grid2">
+                  <div><label>master.json</label><input id="master-file" type="file" accept=".json" /></div>
+                  <div><label>CSV (1行目ヘッダー)</label><input id="csv-file" type="file" accept=".csv" /></div>
+                </div>
+                <div style="margin-top:12px;display:flex;gap:8px;"><button id="run-generate">PPTX生成</button></div>
+                ${state.csvHeaders.length ? `<p>CSVヘッダー: ${state.csvHeaders.map(escapeHTML).join(', ')}</p>` : ''}
+                ${renderNotice(state.generateStatus)}
+              </div>
+            `}
+          </div>`;
+
+        q('#tab-analyze')?.addEventListener('click', () => { state.tab = 'analyze'; render(); });
+        q('#tab-generate')?.addEventListener('click', () => { state.tab = 'generate'; render(); });
+
+        q('#run-analyze')?.addEventListener('click', async () => {
+          const file = q('#analyze-file')?.files?.[0];
+          const page = Number(q('#analyze-page')?.value || 1);
+          if (!file) { state.analyzeStatus = { kind: 'error', message: 'PPTXファイルを選択してください。' }; render(); return; }
+          try {
+            const masterJson = await analyzePptx(file, page);
+            state.analysis = masterJson;
+            state.masterJsonText = JSON.stringify(masterJson, null, 2);
+            state.analyzeStatus = { kind: 'ok', message: `解析完了: 要素${masterJson.pages[0].elements.length}件` };
+          } catch (e) {
+            state.analyzeStatus = { kind: 'error', message: e.message || '解析に失敗しました。' };
+          }
+          render();
+        });
+
+        q('#download-master')?.addEventListener('click', () => {
+          try { downloadJson('master.json', JSON.parse(q('#master-json').value)); state.analyzeStatus = { kind: 'ok', message: 'master.json をダウンロードしました。' }; }
+          catch { state.analyzeStatus = { kind: 'error', message: 'JSON形式が不正です。' }; }
+          render();
+        });
+
+        q('#master-json')?.addEventListener('input', (e) => { state.masterJsonText = e.target.value; });
+
+        q('#run-generate')?.addEventListener('click', async () => {
+          const masterFile = q('#master-file')?.files?.[0];
+          const csvFile = q('#csv-file')?.files?.[0];
+          if (!masterFile || !csvFile) { state.generateStatus = { kind: 'error', message: 'master.json と CSV の両方を選択してください。' }; render(); return; }
+          try {
+            const master = JSON.parse(await masterFile.text());
+            const parsed = Papa.parse(await csvFile.text(), { header: true, skipEmptyLines: true });
+            if (parsed.errors.length) throw new Error(`CSV解析エラー: ${parsed.errors[0].message}`);
+            const rows = parsed.data;
+            const headers = parsed.meta.fields || [];
+            state.csvHeaders = headers;
+            const page = master.pages?.[0];
+            if (!page?.elements) throw new Error('master.json 形式不正: pages[0].elements が必要です。');
+            const required = page.elements.filter((el) => el.binding?.mode === 'field' && el.binding?.key).map((el) => el.binding.key);
+            const missing = required.filter((key) => !headers.includes(key));
+            if (missing.length) throw new Error(`CSV列不足: ${missing.join(', ')}`);
+
+            const pptx = new PptxGenJS();
+            pptx.layout = 'LAYOUT_WIDE';
+            if (master.slideSize?.width && master.slideSize?.height) {
+              pptx.defineLayout({ name: 'CUSTOM', width: master.slideSize.width, height: master.slideSize.height });
+              pptx.layout = 'CUSTOM';
+            }
+
+            let imageWarningCount = 0;
+            rows.forEach((row) => {
+              const slide = pptx.addSlide();
+              page.elements.forEach((el) => {
+                if (el.binding?.mode === 'ignore') return;
+                const val = el.binding?.mode === 'fixed' ? (el.defaultText || '') : (row[el.binding?.key] ?? el.defaultText ?? '');
+                if (el.type === 'text') {
+                  slide.addText(String(val), { x: el.x, y: el.y, w: el.w, h: el.h, fontFace: el.style?.fontFace || 'Arial', fontSize: el.style?.fontSize || 18, bold: !!el.style?.bold, color: el.style?.color || '222222', align: el.style?.align || 'left', fit: 'shrink' });
+                } else if (el.type === 'rectangle') {
+                  slide.addShape(pptx.ShapeType.rect, { x: el.x, y: el.y, w: el.w, h: el.h, line: { color: el.style?.lineColor || '666666', pt: 1 }, fill: { color: el.style?.color || 'F8FAFC' } });
+                } else if (el.type === 'image') {
+                  const textVal = String(val || '');
+                  if (textVal.startsWith('data:image/')) slide.addImage({ data: textVal, x: el.x, y: el.y, w: el.w, h: el.h });
+                  else if (textVal) imageWarningCount += 1;
+                }
+              });
+            });
+            await pptx.writeFile({ fileName: 'output.pptx' });
+            state.generateStatus = { kind: imageWarningCount ? 'warn' : 'ok', message: imageWarningCount ? `PPTXを生成しました。${imageWarningCount}件の画像はdata URL以外のためスキップしました。` : 'PPTXを生成してダウンロードしました。' };
+          } catch (e) {
+            state.generateStatus = { kind: 'error', message: e.message || 'PPTX生成に失敗しました。' };
+          }
+          render();
+        });
+      }
+
+      render();
+    </script>
+  </body>
+</html>
